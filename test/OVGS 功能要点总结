@@ -1,0 +1,228 @@
+OVGS 功能要点总结
+一、核心定位
+OVGS（Ownership Voucher gRPC Service）是一个基于 gRPC 的服务，允许组织管理员管理用户和设备，并使用户能够为被分配的设备请求 RFC8366 所有权凭证（Ownership Voucher）。其核心目的是：让用户为所属组织拥有的网络设备组件（通过序列号 + IEN 标识）请求所有权凭证。
+
+二、认证与授权体系
+维度	说明
+认证	假定由供应商提供，示例基于 OIDC 认证
+授权模型	基于组织树（Organization Tree）的层级授权
+权限继承	用户可访问其所属组及所有子组（子树），子组无法访问父组信息
+权限叠加	当用户属于多个子树且存在重叠时，取最高权限
+三、四级角色体系
+角色	权限范围	可执行 RPC	可被谁分配/移除
+SUPPORT	全部 RPC；委派管理仅限根组 owner org ADMIN	全部	同组/父组的 SUPPORT
+ADMIN	同 SUPPORT；委派管理仅限根组 owner org ADMIN	全部	同组/父组的 SUPPORT/ADMIN
+ASSIGNER	除创建/删除组、用户角色管理、委派组织管理外的所有 RPC	CreateDomainCert, AddSerial, RemoveSerial, GetOwnershipVoucher 等	同组/父组的 SUPPORT/ADMIN
+REQUESTOR	只读 + 请求所有权凭证	GetGroup, GetUserRole, GetDomainCert, GetSerial, GetOwnershipVoucher	同组/父组的 SUPPORT/ADMIN/ASSIGNER
+权限层级：SUPPORT > ADMIN > ASSIGNER > REQUESTOR，高角色包含低角色权限。
+
+四、核心实体
+组织（Organization） — 树的根节点，由供应商引导创建
+组（Group） — 组织内的层级单元，包含序列号、域证书、用户角色映射和子组
+用户（User） — 两类：
+USER：SSO 用户账号
+SERVICE_ACCOUNT：服务账号（用于程序化访问，如引导服务器）
+序列号（Serial Number） — 设备组件标识（IEN + 序列号），默认分配至根组，可由 ASSIGNER/ADMIN 重新分配
+固定域证书（PDC） — 所有权凭证中的信任根，包含证书、吊销检查标志和过期时间
+TPM 信息 — 部分设备关联 TPM 公钥/背书密钥，用于下游验证
+五、跨组织委派机制
+一个组可以被委派给另一个组织，需先将该组织加入组的 允许委派组织列表
+只有 owner org 的根组 ADMIN 可执行委派组织管理（AddGroupDelegatedOrg / RemoveGroupDelegatedOrg）
+委派用户只能操作/查看本组织内的用户，响应会被限制（看不到其他组织的用户）
+委派用户只能添加本组织的用户到组中
+六、gRPC API 一览（14 个端点）
+端点	最低角色	功能
+/CreateGroup	ADMIN	在现有组或组织下创建子组
+/GetGroup	REQUESTOR	查看组的子组、证书ID、序列号、用户映射
+/DeleteGroup	ADMIN	删除空组（无子组/证书/序列号/用户时才允许）
+/AddGroupDelegatedOrg	根组 Owner Org ADMIN	添加允许委派的组织
+/DeleteGroupDelegatedOrg	根组 Owner Org ADMIN	移除委派组织
+/AddUserRole	ADMIN	为组中的用户分配角色
+/RemoveUserRole	ADMIN	移除用户在组中的角色（即撤销访问）
+/GetUserRole	REQUESTOR	查看用户在各组中的角色
+/CreateDomainCert	ASSIGNER	创建 PDC（证书 + 吊销检查 + 过期时间）
+/GetDomainCert	REQUESTOR	查看 PDC 详情
+/DeleteDomainCert	ASSIGNER	删除域证书
+/AddSerial	ASSIGNER	将序列号分配给组
+/RemoveSerial	ASSIGNER	从组中移除序列号
+/GetSerial	REQUESTOR	查询序列号详情（TPM公钥、MAC地址、型号等）
+/GetOwnershipVoucher	REQUESTOR	核心接口 — 请求签发 RFC8366 所有权凭证
+七、所有权凭证签发流程（核心功能）
+/GetOwnershipVoucher 的执行逻辑：
+
+验证请求者权限 — 确认请求者有权访问该序列号对应的设备
+验证时效 — 请求的生命期不能在过去，且须在证书过期时间之内
+签发凭证 — 使用指定参数生成 RFC8366 格式的 CMS 签名凭证
+返回 TPM 信息 — 如可用，附带设备 TPM 公钥/背书证书，供客户做额外验证
+凭证格式遵循 RFC8366 §5.3，包含 created-on、expires-on、serial-number、assertion、pinned-domain-cert、domain-cert-revocation-checks 等字段，以 CMS 二进制格式签名（不加密）。
+
+注意：同一设备 + 同一 PDC + 同一生命期，每次请求都会生成不同的有效凭证。
+
+八、关键设计约束
+组删除条件严格：组内无证书、序列号、子组、用户时才可删除
+序列号唯一分配：一个序列号只能分配给一个非根组，重新分配会自动从原组移除
+委派移除前置：删除委派组织前，须先删除该组织在所有相关组/子组中的委派用户
+组织引导：由供应商负责，不在本服务范围内
+认证依赖：认证机制由供应商提供，本服务不做假设
+总体而言，OVGS 是一个面向网络设备供应链安全的凭证管理服务，通过组织树 + 分级角色 + 跨组织委派实现了细粒度的访问控制，核心价值在于安全地签发和管理设备所有权凭证，支撑设备引导（bootstrapping）场景下的零信任接入。
+
+ovgs.proto
+结合当前的.proto文件重新深入分析
+Read ovgs.proto
+OVGS 深入分析（结合 .proto 与文档）
+一、Proto 定义比文档多出的关键信息
+1. 文档未提及的 RPC：3 个
+RPC	说明
+GetComponents	服务端流式 RPC（stream GetComponentsResponse），返回指定组下所有组件及其序列详情。文档完全未记录
+GetSerials	批量版 GetSerial，一次查询多个组件的序列信息，响应保持请求顺序
+GetOwnershipVouchers	批量版 GetOwnershipVoucher，一次性为多个组件签发所有权凭证
+这说明 OVGS 实际提供 17 个 RPC（而非文档中的 14 个），且支持流式和批量操作。
+
+2. GetGroupResponse.delegated_orgs 的通配符机制
+Proto 第 168-169 行明确定义：
+
+
+map<string, GroupList> delegated_orgs = 7;
+// If the map has "*" as key, delegation is allowed to any org.
+文档未提及：org_id 可设为 "*" 表示允许任意组织委派访问。这是一个重要的开放策略选项，在 AddGroupDelegatedOrgRequest 中同样支持（第 183 行注释）。
+
+3. CreateGroup 的委派继承
+Proto 第 371 行注释：
+
+
+// A group inherits delegated_orgs from its parent.
+文档未提及：新建组会自动继承父组的委派组织列表，而非从空开始。这显著影响了组织树的规划策略。
+
+4. CreateGroup 的 ALREADY_EXISTS 约束
+Proto 第 375-376 行：
+
+
+// ALREADY_EXISTS if a group already exists with the same parent group and description.
+文档未提及：同一父组下不允许重名组，description 在同一父组内具有唯一性约束。
+
+5. 角色分配的调用者约束
+Proto 第 203-207 行明确了谁可以分配什么角色：
+
+
+Caller Role    |   Assignable Roles
+ ADMIN         |    ADMIN, ASSIGNER, REQUESTOR
+ ASSIGNER      |    ASSIGNER, REQUESTOR
+ REQUESTOR     |    NA (cannot assign roles)
+文档仅说了 ADMIN 可以调用 AddUserRole，未提及 ASSIGNER 也可以分配 ASSIGNER/REQUESTOR 角色。
+
+二、数据模型深度解析
+实体关系图
+
+Organization (root group, group_id = org_id)
+  ├── Group (child, inherits delegated_orgs)
+  │     ├── Component (ien + serial_number)
+  │     │     └── TpmInfo { ek_data: endorsement_key | ek_certificate, platform_primary_key }
+  │     ├── DomainCert (cert_id, certificate_der, revocation_checks, expiry_time)
+  │     ├── User (username, user_type, org_id, user_role)
+  │     ├── delegated_orgs: map<org_id, GroupList>
+  │     └── Child Groups (recursive)
+  └── All Serial Numbers (default allocation)
+TpmInfo — TPM 多版本支持
+Proto 的 oneof ek_data 精确区分了 TPM 版本差异：
+
+字段	适用场景	TPM 版本
+endorsement_key	仅背书密钥公钥	TPM 1.2
+ek_certificate	完整 X.509 背书证书	TPM 2.0 + IDevID
+platform_primary_key	平台主密钥公钥	TPM 2.0 无 IDevID
+public_key_der 已标记 deprecated = true，统一迁移至 TpmInfo 结构。
+
+Component 的双字段标识
+
+message Component {
+  string ien = 1;           // IANA Enterprise Number (如 30065 = Arista)
+  string serial_number = 2; // 设备序列号
+}
+IEN 是厂商标识，与序列号组合才能全球唯一。这也意味着 OVGS 天然支持多厂商设备共存于同一服务。
+
+三、权限与安全机制深度剖析
+3.1 层级权限继承与隔离
+
+         Org (root)
+           │
+         Group A ← user1: ADMIN
+        ┌────┴────┐
+     Group B    Group C
+   user2:       user3:
+   REQUESTOR    ASSIGNER
+user1 可访问 A、B、C（整个子树）
+user2 只能访问 B 及其子树（只读 + 请求 OV）
+user2 无法访问 Group A 或 C 的数据
+如果 user2 同时属于 A（REQUESTOR）和 B（REQUESTOR），重叠处取最高权限
+3.2 跨组织委派的安全边界
+Proto 对委派场景的约束非常细致：
+
+操作	本组织调用者	委派调用者
+AddUserRole	可添加任何用户（需委派组织在 delegated_orgs 中）	只能添加本组织用户
+RemoveUserRole	可移除任何用户	只能移除本组织用户
+GetGroup	返回所有用户 + 所有委派组织	仅返回本组织用户 + 仅显示本组织委派信息
+GetUserRole	可查看同组用户角色	无法查看 owner org 用户的角色
+3.3 AddSerial 的双重权限校验
+Proto 第 473-476 行揭示了一个关键安全逻辑：
+
+
+// PERMISSION_DENIED If the caller doesn't have permission for the source and
+//   destination groups. If the source is not a non-root group (ie: only exists
+//   in the root group), the user must also have permission to the root group.
+移动序列号时，调用者必须同时拥有源组和目标组的权限。如果序列号仅在根组（未被分配到任何子组），则还需根组权限。
+
+3.4 GetOwnershipVoucher 的多重校验
+Proto 第 526-529 行：
+
+
+// INVALID_ARGUMENT if ... the org of the cert and serial are not same.
+文档提到但未在示例中强调：证书和序列号必须属于同一组织，否则拒绝签发。这防止了跨组织的凭证误签。
+
+四、错误体系（Proto 完整定义）
+错误码	触发场景	涉及 RPC
+INVALID_ARGUMENT	空字段、过期时间、无效证书、IEN 不适用、重名组、不允许自委派	几乎所有 RPC
+NOT_FOUND	组/组件/证书/用户不存在	几乎所有 RPC
+ALREADY_EXISTS	组重名、用户已存在、证书三元组重复、委派组织已存在	CreateGroup, AddUserRole, CreateDomainCert, AddGroupDelegatedOrg
+FAILED_PRECONDITION	删除非空组、组件/证书不存在时请求OV	DeleteGroup, GetOwnershipVoucher, RemoveGroupDelegatedOrg
+PERMISSION_DENIED	无权限访问	所有 RPC
+五、文档与 Proto 的差异/矛盾点
+#	差异	文档	Proto
+1	RPC 总数	14 个	17 个（多 GetComponents/GetSerials/GetOwnershipVouchers）
+2	ASSIGNER 可分配角色	仅 ADMIN 可 AddUserRole	ASSIGNER 也可分配 ASSIGNER/REQUESTOR
+3	委派通配符 "*"	未提及	支持 "*" 允许任意组织委派
+4	新组继承委派	未提及	自动继承父组 delegated_orgs
+5	组名唯一性	未提及	同父组下 description 唯一
+6	AddGroupDelegatedOrg 自委派	未提及	禁止 org_id 等于组所属 org（不允许自委派）
+7	SUPPORT 角色	表格中提到但未详细定义	Proto 中 USER_ROLE_SUPPORT = 1，用于供应商内部运维
+8	CreateDomainCert 去重	未提及	相同 (certificate_der, revocation_checks, expiry_time) 三元组不可重复创建
+六、架构设计要点总结
+树状多租户模型：组织 → 根组 → 子组（单父多子），天然映射企业组织架构
+最小权限原则：四级角色 + 子树隔离 + 委派边界，确保用户只能操作其可见范围内的资源
+序列号双重归属：始终属于根组 + 最多一个子组，便于全局盘点又支持局部分配
+PDC 不继承：域证书绑定到组而不下传子组，同一证书可手动关联多个组
+凭证签发幂等性：相同参数每次签发生成不同凭证，均为有效凭证（CMS 签名含时间戳等因素）
+批量/流式支持：GetComponents（流式）、GetSerials/GetOwnershipVouchers（批量），适配大规模设备管理场景
+TPM 渐进演进：public_key_der → TpmInfo，支持 TPM 1.2/2.0 + IDevID 多种硬件信任锚
+委派继承 + 通配符：新建组自动继承委派策略，"*" 通配符允许开放委派，兼顾安全与灵活性
+ovgs.proto
+将分析内容写入md，放在test文件夹下
+Bash Check if test directory exists
+IN
+ls /Users/hongjie/Workspace/ovgs/test/ 2>/dev/null || echo "directory does not exist"
+
+OUT
+(Bash completed with no output)
+Write ovgs-analysis.md
+334 lines
+已将完整分析报告写入 test/ovgs-analysis.md，包含以下 11 个章节：
+
+核心定位 — 项目概述与协议信息
+认证与授权体系 — 层级授权模型与权限继承/叠加
+四级角色体系 — 角色 enum 定义、权限矩阵、分配约束
+核心数据模型 — 实体关系图、Component/TpmInfo/AccountType/GetGroupResponse 详解
+跨组织委派机制 — 通配符 "*"、委派继承、安全边界、删除前置条件
+gRPC API 完整一览（17 个 RPC） — 比文档多 3 个（GetComponents/GetSerials/GetOwnershipVouchers）
+所有权凭证签发流程 — 完整执行逻辑与凭证格式
+AddSerial 双重权限校验 — 源组+目标组权限验证
+错误体系完整定义 — 5 类错误码及触发场景
+文档与 Proto 差异/矛盾点 — 10 项差异对照
+架构设计要点总结 — 10 条核心设计原则
